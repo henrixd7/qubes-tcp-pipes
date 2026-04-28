@@ -12,6 +12,22 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 
+try:
+    # Package mode: explicit imports from sibling modules
+    from app.utils import (
+        THEME, FONT_MAIN, FONT_BOLD, FONT_LARGE, FONT_SMALL,
+        LAYOUT, CACHE_REFRESH_INTERVAL, get_port_color,
+    )
+    from app.models import VM
+    from app.cache import save_port_cache, load_port_cache
+    from app.qubes import (
+        create_connection, kill_connection_process, remove_policy_rule,
+        cleanup_policy_file, get_running_vms, get_listening_ports,
+        is_connection_alive,
+    )
+except ImportError:
+    pass  # concatenated mode: all symbols already in global scope
+
 
 class QubePipesApp:
     """Main application controller and Tkinter UI."""

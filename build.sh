@@ -8,8 +8,8 @@ OUT="qubes-tcp-pipes.py"
 {
   echo '#!/usr/bin/env python3'
   cat \
-    app/utils.py \
     app/models.py \
+    app/utils.py \
     app/cache.py \
     app/qubes.py \
     app/ui.py \

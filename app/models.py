@@ -1,6 +1,7 @@
 # ── models.py ─────────────────────────────────────────────────────────────
 # Data classes: VM and Connection.
-# When concatenated into a single-file build this module is loaded second.
+# When concatenated into a single-file build this module is loaded first
+# (defines Connection and VM before any other module references them).
 
 
 class VM:

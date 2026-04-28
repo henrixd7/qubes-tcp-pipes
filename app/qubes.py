@@ -1,7 +1,7 @@
 # ── qubes.py ──────────────────────────────────────────────────────────────
 # Qubes-specific logic: VM discovery, port scanning, policy management,
 # and connection lifecycle (create / delete / kill).
-# Depends on: utils (run_cmd, POLICY_FILE, EXCLUDED_VMS), models (Connection)
+# Depends on: utils (POLICY_FILE, EXCLUDED_VMS, run_cmd), models (Connection)
 # When concatenated into a single-file build this module is loaded fourth.
 
 import os
@@ -10,6 +10,12 @@ import tempfile
 import threading
 import time
 import qubesadmin
+
+try:
+    from app.utils import POLICY_FILE, EXCLUDED_VMS, run_cmd  # package mode
+    from app.models import Connection  # package mode
+except ImportError:
+    pass  # concatenated mode: already in global scope
 
 
 def get_running_vms():
@@ -29,20 +35,13 @@ def get_running_vms():
         return []
 
 
-def get_listening_ports(vm_name, run_cmd_fn=None):
+def get_listening_ports(vm_name):
     """Scan listening TCP ports on *vm_name* via ``ss -ltn``."""
-    if run_cmd_fn is None:
-        try:
-            from app import utils
-            run_cmd_fn = utils.run_cmd
-        except ImportError:
-            run_cmd_fn = run_cmd  # single-file build: global scope
-
     cmd = [
         "qvm-run", "-q", "--pass-io", "--no-gui", "--no-autostart",
         vm_name, "ss -ltn",
     ]
-    output = run_cmd_fn(cmd)
+    output = run_cmd(cmd)
     ports = set()
 
     for line in output.splitlines():

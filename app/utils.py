@@ -1,6 +1,6 @@
 # ── utils.py ──────────────────────────────────────────────────────────────
 # Shared constants, theme, and helper utilities.
-# When concatenated into a single-file build this module is loaded first.
+# When concatenated into a single-file build this module is loaded second.
 
 import subprocess
 import os

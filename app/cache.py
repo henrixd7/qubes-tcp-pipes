@@ -7,6 +7,11 @@ import json
 import threading
 import os
 
+try:
+    from app.utils import CACHE_DIR, CACHE_FILE  # package mode
+except ImportError:
+    pass  # concatenated mode: already in global scope
+
 _cache_lock = threading.Lock()
 
 
