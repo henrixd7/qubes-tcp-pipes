@@ -17,8 +17,11 @@ def save_port_cache(vm_name, ports):
             os.makedirs(CACHE_DIR, exist_ok=True)
             cache = {}
             if os.path.exists(CACHE_FILE):
-                with open(CACHE_FILE, "r") as f:
-                    cache = json.load(f)
+                try:
+                    with open(CACHE_FILE, "r") as f:
+                        cache = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    cache = {}  # corrupted or unreadable — start fresh
 
             cache[vm_name] = ports
             tmp_file = CACHE_FILE + ".tmp"
@@ -34,8 +37,12 @@ def load_port_cache():
     with _cache_lock:
         try:
             if os.path.exists(CACHE_FILE):
-                with open(CACHE_FILE, "r") as f:
-                    return json.load(f)
+                try:
+                    with open(CACHE_FILE, "r") as f:
+                        return json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    print("Warning: port cache corrupted, returning empty")
+                    return {}
         except Exception as e:
             print(f"Warning: failed to load port cache: {e}")
     return {}

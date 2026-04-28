@@ -25,6 +25,7 @@ class QubePipesApp:
         self.connections = []
         self.selected_source_vm = None
         self.known_source_ports = {}
+        self._state_lock = threading.Lock()
         self._background_refresh_running = False
         self._last_refresh_time = None
         self.last_width = self.root.winfo_width()
@@ -83,6 +84,8 @@ class QubePipesApp:
     def cleanup(self):
         self._background_refresh_running = False
         if self._status_timer_id:
+            # May be called from a signal handler (arbitrary thread).
+            # after_cancel is a Tk call — guard against threading errors.
             try:
                 self.root.after_cancel(self._status_timer_id)
             except Exception:
@@ -97,7 +100,8 @@ class QubePipesApp:
     def refresh_vms(self):
         self.selected_source_vm = None
         current_vms = get_running_vms()
-        self.vms = {name: self.vms.get(name, VM(name, 0, 0)) for name in current_vms}
+        with self._state_lock:
+            self.vms = {name: self.vms.get(name, VM(name, 0, 0)) for name in current_vms}
         self.connections = [conn for conn in self.connections
             if conn.client_name in self.vms and conn.server_name in self.vms]
         cache = load_port_cache()
@@ -110,7 +114,9 @@ class QubePipesApp:
         threading.Thread(target=self.discover_ports_worker, daemon=True).start()
 
     def discover_ports_worker(self):
-        for name in list(self.vms.keys()):
+        with self._state_lock:
+            vm_names = list(self.vms.keys())
+        for name in vm_names:
             try:
                 ports = get_listening_ports(name)
                 save_port_cache(name, ports)
@@ -126,11 +132,31 @@ class QubePipesApp:
                 if not self._background_refresh_running:
                     break
                 self.discover_ports_worker()
-                self._last_refresh_time = time.time()
-                self.root.after(0, self.update_status_bar)
+                # Defer all state + UI updates to the Tk thread
+                now = time.time()
+                self.root.after(0, self._on_background_refresh_done, now)
         threading.Thread(target=_loop, daemon=True).start()
 
+    def _on_background_refresh_done(self, timestamp):
+        """Called on the Tk thread after a background port refresh cycle."""
+        self._last_refresh_time = timestamp
+        self.update_status_bar()
+
+    def _prune_dead_connections(self):
+        """Remove connections whose qvm-run process has exited."""
+        still_alive = []
+        for conn in self.connections:
+            if is_connection_alive(conn):
+                still_alive.append(conn)
+            else:
+                remove_policy_rule(conn)
+
+        if len(still_alive) < len(self.connections):
+            self.connections = still_alive
+            self.redraw_connections()
+
     def _update_status_timer(self):
+        self._prune_dead_connections()
         self.update_status_bar()
         self._status_timer_id = self.root.after(1000, self._update_status_timer)
 
@@ -161,7 +187,7 @@ class QubePipesApp:
         self.update_status_bar()
 
     def on_resize(self, event):
-        if abs(event.width - self.last_width) > 20:
+        if abs(event.width - self.last_width) > LAYOUT["resize_threshold"]:
             self.last_width = event.width
             self.render_vms(event.width)
 
@@ -170,19 +196,19 @@ class QubePipesApp:
         self._hover_bind_ids.clear()
         width = width or self.canvas.winfo_width()
         if width < 10:
-            width = 1200
-        cols = max(1, width // 280)
+            width = LAYOUT["min_canvas_width"]
+        cols = max(1, width // LAYOUT["col_spacing"])
         for i, (name, vm) in enumerate(self.vms.items()):
             row, col = divmod(i, cols)
-            vm.x = 140 + col * 280
-            vm.y = 80 + row * 160
+            vm.x = LAYOUT["grid_origin_x"] + col * LAYOUT["col_spacing"]
+            vm.y = LAYOUT["grid_origin_y"] + row * LAYOUT["row_spacing"]
             self.draw_vm_box(vm)
             if vm.ports:
                 self.update_vm_ports_ui(name, vm.ports, redraw_lines=False)
         self.redraw_connections()
 
     def draw_vm_box(self, vm):
-        px, py = 55, 45
+        px, py = LAYOUT["vm_half_w"], LAYOUT["vm_half_h"]
         vm.shadow_id = self.canvas.create_rectangle(
             vm.x - px + 2, vm.y - py + 2, vm.x + px + 2, vm.y + py + 2,
             fill=THEME["shadow"], outline="", tags=("vm_element", "vm_box", vm.name))
@@ -215,16 +241,17 @@ class QubePipesApp:
         self.canvas.tag_bind(vm.canvas_id, "<Leave>", on_leave)
 
     def update_vm_ports_ui(self, name, ports, redraw_lines=True):
-        if name not in self.vms:
-            return
-        vm = self.vms[name]
+        with self._state_lock:
+            if name not in self.vms:
+                return
+            vm = self.vms[name]
         sorted_ports = sorted(ports, key=lambda p: int(p) if p.isdigit() else p)
         vm.update_ports(sorted_ports)
         for pid in vm.port_ids.values():
             self.canvas.delete(pid)
         vm.port_ids.clear()
         self.canvas.delete(f"vm_port_{name}")
-        px, py_val = 55, 45
+        px, py_val = LAYOUT["vm_half_w"], LAYOUT["vm_half_h"]
         x2 = vm.x + px
         y1, y2 = vm.y - py_val, vm.y + py_val
         for i, port in enumerate(sorted_ports):
@@ -242,7 +269,7 @@ class QubePipesApp:
 
     def get_port_coords(self, vm, port):
         """Pure mathematical alignment calculation. Prevents Tkinter race-condition jitter."""
-        px, py = 55, 45
+        px, py = LAYOUT["vm_half_w"], LAYOUT["vm_half_h"]
         x2 = vm.x + px
         y1, y2 = vm.y - py, vm.y + py
         all_ports = sorted(vm.ports, key=lambda p: int(p) if p.isdigit() else p)
@@ -308,13 +335,13 @@ class QubePipesApp:
         """Orthogonal channel routing strictly avoiding VM boxes and nesting parallel lanes."""
         lane_spacing = 10
         offset = (idx - (total - 1) / 2.0) * lane_spacing
-        col_src = int((src_x - 140) // 280)
-        col_dst = int((dst_x - 140) // 280)
-        row_src = int((src_y - 80 + 45) // 160)
-        row_dst = int((dst_y - 80 + 45) // 160)
+        col_src = int((src_x - LAYOUT["grid_origin_x"]) // LAYOUT["col_spacing"])
+        col_dst = int((dst_x - LAYOUT["grid_origin_x"]) // LAYOUT["col_spacing"])
+        row_src = int((src_y - LAYOUT["grid_origin_y"] + LAYOUT["vm_half_h"]) // LAYOUT["row_spacing"])
+        row_dst = int((dst_y - LAYOUT["grid_origin_y"] + LAYOUT["vm_half_h"]) // LAYOUT["row_spacing"])
         path = [(src_x, src_y)]
-        v_chan_src = (140 + col_src * 280) + 95 + offset
-        v_chan_dst = (140 + col_dst * 280) + 95 + offset
+        v_chan_src = (LAYOUT["grid_origin_x"] + col_src * LAYOUT["col_spacing"]) + LAYOUT["v_chan_offset"] + offset
+        v_chan_dst = (LAYOUT["grid_origin_x"] + col_dst * LAYOUT["col_spacing"]) + LAYOUT["v_chan_offset"] + offset
         max_row = max(row_src, row_dst)
         if col_src == col_dst:
             if row_src == row_dst:
@@ -323,9 +350,9 @@ class QubePipesApp:
                 path.extend([(v_chan_src, src_y), (v_chan_src, dst_y), (dst_x, dst_y)])
             return path, v_chan_src + 6, (src_y + dst_y) / 2
         if row_src == row_dst:
-            h_chan = 160 * (row_src + 1) + offset
+            h_chan = LAYOUT["row_spacing"] * (row_src + 1) + offset
         else:
-            h_chan = 160 * max_row + offset
+            h_chan = LAYOUT["row_spacing"] * max_row + offset
         path.extend([
             (v_chan_src, src_y), (v_chan_src, h_chan),
             (v_chan_dst, h_chan), (v_chan_dst, dst_y), (dst_x, dst_y)])
