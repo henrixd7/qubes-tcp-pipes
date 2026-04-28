@@ -35,9 +35,14 @@ sudo qubes-dom0-update python3-tkinter
 ## Usage
 
 1. Ensure `python3-tkinter` is installed.
-2. Run the script:
+2. Run the application:
    ```bash
+   # Development (from source tree)
    python3 main.py
+
+   # Or build a single-file for easy deployment:
+   bash build.sh          # produces qubes-tcp-pipes.py
+   python3 qubes-tcp-pipes.py
    ```
 3. **To create a connection**:
    - Click on a VM box to select it as the **Client**.
@@ -45,7 +50,7 @@ sudo qubes-dom0-update python3-tkinter
 4. **To remove a connection**:
    - Right-click the connection line and confirm deletion.
 5. **To cleanup**:
-   - Simply close the application window.
+   - Simply close the application window — all pipes and policy rules are removed automatically.
 
 ## How it Works
 
