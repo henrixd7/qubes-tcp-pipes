@@ -183,6 +183,18 @@ class QubePipesApp:
         if client_name not in self.known_source_ports:
             self.known_source_ports[client_name] = set()
         self.known_source_ports[client_name].add(str(local_port))
+
+        # Optimistically add the source port to the client VM so the
+        # connection line renders from the correct position immediately.
+        # The next background port-scan will reconcile with reality.
+        client_vm = self.vms.get(client_name)
+        if client_vm:
+            port_str = str(local_port)
+            if port_str not in client_vm.ports:
+                client_vm.ports.append(port_str)
+                save_port_cache(client_name, client_vm.ports)
+                self.update_vm_ports_ui(client_name, client_vm.ports)
+
         self.redraw_connections()
         self.update_status_bar()
 
