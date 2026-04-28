@@ -77,16 +77,21 @@ def _read_policy_rules():
     try:
         with open(POLICY_FILE, "r") as f:
             for line in f:
-                rule = line.rstrip("\n")
+                rule = line.strip()
                 if _validate_policy_rule(rule):
-                    rules.append(rule)
+                    # Normalize to canonical single-space format
+                    parts = rule.split()
+                    rules.append(" ".join(parts))
     except Exception as e:
         print(f"Warning: failed to read policy file: {e}")
     return rules
 
 
 def _validate_policy_rule(rule):
-    """Check that *rule* matches the expected qubes.ConnectTCP format."""
+    """Check that *rule* matches the expected qubes.ConnectTCP format.
+
+    Validates structure, port range (1-65535), and semantic consistency.
+    """
     if not rule:
         return False
     parts = rule.split()
@@ -95,9 +100,16 @@ def _validate_policy_rule(rule):
         return False
     if parts[0] != "qubes.ConnectTCP":
         return False
-    if not parts[1].startswith("+") or not parts[1][1:].isdigit():
+    port_str = parts[1]
+    if not port_str.startswith("+") or not port_str[1:].isdigit():
+        return False
+    port = int(port_str[1:])
+    if port < 1 or port > 65535:
         return False
     if parts[4] != "allow":
+        return False
+    # Client and server must not be empty after stripping
+    if not parts[2] or not parts[3]:
         return False
     return True
 
@@ -123,6 +135,15 @@ def _write_policy_rules(rules):
 
 def add_policy_rule(client_name, remote_port, server_name):
     """Add a qubes.ConnectTCP allow rule (deduplicated, atomic write)."""
+    try:
+        port = int(remote_port)
+    except (TypeError, ValueError):
+        print(f"Invalid port: {remote_port!r}")
+        return False
+    if port < 1 or port > 65535:
+        print(f"Port out of range: {port}")
+        return False
+
     rule = _RULE_PATTERN.format(
         port=remote_port, client=client_name, server=server_name
     )
