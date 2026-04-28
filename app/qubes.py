@@ -208,15 +208,16 @@ def kill_connection_process(conn):
 
 
 def create_connection(client_name, local_port, server_name, remote_port):
-    """Create a new qvm-connect-tcp pipe and return a Connection object.
+    """Create a new qvm-connect-tcp pipe.
+
+    Returns ``(Connection, None)`` on success or ``(None, error_msg)`` on failure.
 
     After writing the policy rule, retries the qvm-run spawn with exponential
     backoff until the process stays alive (policy is picked up by qubesd) or
-    max retries is reached.  This replaces the old non-deterministic
-    ``time.sleep(0.5)`` hack.
+    max retries is reached.
     """
     if not add_policy_rule(client_name, remote_port, server_name):
-        return None
+        return None, f"Failed to write policy rule for {client_name} → {server_name}:{remote_port}"
 
     cmd = [
         "qvm-run", "--pass-io", "--no-gui", "--no-autostart",
@@ -231,8 +232,7 @@ def create_connection(client_name, local_port, server_name, remote_port):
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except Exception as e:
-            print(f"Failed to start connection: {e}")
-            return None
+            return None, f"Failed to start qvm-run: {e}"
 
         # Brief probe: if the process is still running after 100 ms the
         # policy was accepted and the tunnel is live.
@@ -240,7 +240,7 @@ def create_connection(client_name, local_port, server_name, remote_port):
         if process.poll() is None:
             conn = Connection(client_name, local_port, server_name, remote_port)
             conn.process = process
-            return conn
+            return conn, None
 
         # Process exited immediately — policy likely not yet in effect.
         # Clean up the zombie and retry with backoff.
@@ -255,6 +255,7 @@ def create_connection(client_name, local_port, server_name, remote_port):
                   f"(attempt {attempt + 1}/{max_retries})")
             time.sleep(backoff)
 
-    print("Failed to establish connection: policy not picked up after "
-          f"{max_retries} retries")
-    return None
+    return None, (
+        f"Connection from {client_name}:{local_port} → {server_name}:{remote_port} "
+        f"failed — policy not picked up after {max_retries} retries"
+    )

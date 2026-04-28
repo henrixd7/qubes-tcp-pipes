@@ -108,22 +108,24 @@ class QubePipesApp:
                 pass
             self._status_timer_id = None
         print("Cleaning up temporary pipes...")
-        for conn in self.connections:
+        with self._state_lock:
+            conns = list(self.connections)
+            self.connections.clear()
+        for conn in conns:
             kill_connection_process(conn)
         cleanup_policy_file()
-        self.connections.clear()
 
     def refresh_vms(self):
         self.selected_source_vm = None
         current_vms = get_running_vms()
+        cache = load_port_cache()
         with self._state_lock:
             self.vms = {name: self.vms.get(name, VM(name, 0, 0)) for name in current_vms}
-        self.connections = [conn for conn in self.connections
-            if conn.client_name in self.vms and conn.server_name in self.vms]
-        cache = load_port_cache()
-        for name, vm in self.vms.items():
-            if name in cache:
-                vm.update_ports(cache[name])
+            self.connections = [conn for conn in self.connections
+                if conn.client_name in self.vms and conn.server_name in self.vms]
+            for name, vm in self.vms.items():
+                if name in cache:
+                    vm.update_ports(cache[name])
         self.render_vms()
         self._last_refresh_time = time.time()
         self.update_status_bar()
@@ -160,15 +162,19 @@ class QubePipesApp:
 
     def _prune_dead_connections(self):
         """Remove connections whose qvm-run process has exited."""
-        still_alive = []
-        for conn in self.connections:
-            if is_connection_alive(conn):
-                still_alive.append(conn)
-            else:
-                remove_policy_rule(conn)
+        pruned = False
+        with self._state_lock:
+            still_alive = []
+            for conn in self.connections:
+                if is_connection_alive(conn):
+                    still_alive.append(conn)
+                else:
+                    remove_policy_rule(conn)
+                    pruned = True
 
-        if len(still_alive) < len(self.connections):
-            self.connections = still_alive
+            if pruned:
+                self.connections = still_alive
+        if pruned:
             self.redraw_connections()
 
     def _update_status_timer(self):
@@ -185,32 +191,37 @@ class QubePipesApp:
 
     def delete_connection(self, conn):
         kill_connection_process(conn)
-        if conn in self.connections:
-            self.connections.remove(conn)
+        with self._state_lock:
+            if conn in self.connections:
+                self.connections.remove(conn)
         remove_policy_rule(conn)
         self.redraw_connections()
         self.update_status_bar()
 
     def create_connection(self, client_name, local_port, server_name, remote_port):
-        conn = create_connection(client_name, local_port, server_name, remote_port)
+        conn, err = create_connection(client_name, local_port, server_name, remote_port)
         if conn is None:
+            messagebox.showerror("Connection Failed", err or "Unknown error")
             return
-        self.connections.append(conn)
-        if client_name not in self.known_source_ports:
-            self.known_source_ports[client_name] = set()
-        self.known_source_ports[client_name].add(str(local_port))
 
-        # Optimistically add the source port to the client VM so the
-        # connection line renders from the correct position immediately.
-        # The next background port-scan will reconcile with reality.
-        client_vm = self.vms.get(client_name)
-        if client_vm:
-            port_str = str(local_port)
-            if port_str not in client_vm.ports:
+        port_str = str(local_port)
+        client_vm = None
+        with self._state_lock:
+            self.connections.append(conn)
+            if client_name not in self.known_source_ports:
+                self.known_source_ports[client_name] = set()
+            self.known_source_ports[client_name].add(port_str)
+
+            # Optimistically add the source port to the client VM so the
+            # connection line renders from the correct position immediately.
+            # The next background port-scan will reconcile with reality.
+            client_vm = self.vms.get(client_name)
+            if client_vm and port_str not in client_vm.ports:
                 client_vm.ports.append(port_str)
-                save_port_cache(client_name, client_vm.ports)
-                self.update_vm_ports_ui(client_name, client_vm.ports)
 
+        if client_vm:
+            save_port_cache(client_name, client_vm.ports)
+            self.update_vm_ports_ui(client_name, client_vm.ports)
         self.redraw_connections()
         self.update_status_bar()
 
@@ -273,8 +284,8 @@ class QubePipesApp:
             if name not in self.vms:
                 return
             vm = self.vms[name]
-        sorted_ports = sorted(ports, key=lambda p: int(p) if p.isdigit() else p)
-        vm.update_ports(sorted_ports)
+            sorted_ports = sorted(ports, key=lambda p: int(p) if p.isdigit() else p)
+            vm.update_ports(sorted_ports)
         for pid in vm.port_ids.values():
             self.canvas.delete(pid)
         vm.port_ids.clear()
