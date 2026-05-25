@@ -29,6 +29,8 @@ THEME = {
     "vm_hover_bg": "#F8F9FA",
     "port_fill": "#20C997",
     "port_border": "#198754",
+    "error_port_fill": "#DC3545",
+    "error_port_border": "#A71D2A",
     "line": "#0D6EFD",
     "shadow": "#D0D4D8",
     "status_bg": "#F0F2F5",

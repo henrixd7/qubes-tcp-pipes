@@ -146,10 +146,30 @@ class QubePipesApp:
     def discover_ports_worker(self):
         with self._state_lock:
             vm_names = list(self.vms.keys())
+            conns = list(self.connections)
         for name in vm_names:
             try:
                 ports = get_listening_ports(name)
                 save_port_cache(name, ports)
+
+                # Task 2: track error ports — rebuild from scratch each cycle
+                # so orphaned ports (whose connection was pruned) are cleaned up.
+                with self._state_lock:
+                    vm = self.vms.get(name)
+                    if vm is None:
+                        continue
+                    new_error = set()
+                    # For each connection involving this VM, check its ports.
+                    for conn in conns:
+                        if conn.server_name == name:
+                            rp = str(conn.remote_port)
+                            if rp not in ports:
+                                new_error.add(rp)
+                        if conn.client_name == name:
+                            lp = str(conn.local_port)
+                            if lp not in ports:
+                                new_error.add(lp)
+                    vm.error_ports = new_error
                 self.root.after(0, self.update_vm_ports_ui, name, ports)
             except Exception as e:
                 print(f"Warning: failed to scan ports for {name}: {e}")
@@ -367,31 +387,20 @@ class QubePipesApp:
                 return
             vm = self.vms[name]
             sorted_ports = sorted(ports, key=lambda p: int(p) if p.isdigit() else p)
-            vm.update_ports(sorted_ports)
+
+            # Task 2: merge error ports into the display list so they stay visible.
+            error_set = set(getattr(vm, '_error_ports', set()))
+            all_display_ports = list(sorted_ports)
+            for ep in sorted(error_set, key=lambda p: int(p) if p.isdigit() else p):
+                if ep not in all_display_ports:
+                    all_display_ports.append(ep)
+
+            vm.update_ports(all_display_ports)
             # Recalculate VM height based on new port count.
             old_half_h = getattr(vm, 'half_h', None)
             vm.half_h = self._vm_height(vm.ports) // 2
             half_h_changed = old_half_h is not None and old_half_h != vm.half_h
 
-            # If VM grew/shrank, rebuild routing grid with updated heights.
-            if half_h_changed:
-                cols = max(1, self.canvas.winfo_width() // LAYOUT["col_spacing"])
-                n_vms = len(self.vms)
-                # Recompute row_max_heights from current VM heights.
-                new_max_h = {}
-                for v in self.vms.values():
-                    r = (v.y - LAYOUT["grid_origin_y"]) // (LAYOUT["base_vm_h"] + MIN_ROW_GAP) if hasattr(self, '_row_starts') else 0
-                    h = v.half_h * 2
-                    new_max_h[r] = max(new_max_h.get(r, 0), h)
-                self._row_max_heights = new_max_h
-                canvas_h = self.canvas.winfo_height()
-                self._routing_grid = build_grid(
-                    n_vms, cols,
-                    getattr(self, '_row_starts', {0: LAYOUT["grid_origin_y"]}),
-                    self._row_max_heights,
-                    self.canvas.winfo_width(), canvas_h,
-                    LAYOUT,
-                )
         for pid in vm.port_ids.values():
             self.canvas.delete(pid)
         vm.port_ids.clear()
@@ -400,30 +409,42 @@ class QubePipesApp:
         py_val = getattr(vm, 'half_h', None) or (LAYOUT["base_vm_h"] // 2)
         y1, y2 = vm.y - py_val, vm.y + py_val
         max_per_side = self._max_ports_per_side(vm)
-        n_right = min(len(sorted_ports), max_per_side)
-        n_left = len(sorted_ports) - max_per_side
-        for i, port in enumerate(sorted_ports):
+        n_right = min(len(all_display_ports), max_per_side)
+        n_left = len(all_display_ports) - max_per_side
+        for i, port in enumerate(all_display_ports):
             if i < max_per_side:
                 # Right side
                 x2 = vm.x + px
                 py_pos = y1 + (i + 1) * (y2 - y1) / (n_right + 1)
-                text_x = x2 + 24
+                text_x = x2 + 10  # Task 3: inside VM box, near edge
             else:
                 # Left side
                 local_idx = i - max_per_side
                 x2 = vm.x - px
                 py_pos = y1 + (local_idx + 1) * (y2 - y1) / (n_left + 1)
-                text_x = x2 - 24
+                text_x = x2 - 10  # Task 3: inside VM box, near edge
             port_tag = f"vm_port_{name}"
+
+            # Task 2: color error ports red instead of green.
+            is_error = port in error_set
+            fill_color = THEME["error_port_fill"] if is_error else THEME["port_fill"]
+            border_color = THEME["error_port_border"] if is_error else THEME["port_border"]
+
             port_id = self.canvas.create_oval(
                 x2 - 6, py_pos - 6, x2 + 6, py_pos + 6,
-                fill=THEME["port_fill"], outline=THEME["port_border"], width=1,
+                fill=fill_color, outline=border_color, width=1,
                 tags=("vm_element", "port", port_tag))
-            self.canvas.create_text(text_x, py_pos, text=port, font=FONT_MAIN,
+            # Task 3: bold font for port numbers
+            self.canvas.create_text(text_x, py_pos, text=port, font=FONT_BOLD,
                 fill=THEME["text_main"], anchor=tk.E if i >= max_per_side else tk.W,
                 tags=("vm_element", "port_text", port_tag))
             vm.port_ids[port] = port_id
-        if redraw_lines:
+
+        # Task 5: when VM height changes, defer a full re-render so that
+        # all port updates from discover_ports_worker complete first.
+        if half_h_changed:
+            self.root.after(0, self.render_vms)
+        elif redraw_lines:
             self.redraw_connections()
 
     # ── Port-side helpers ───────────────────────────────────────────────
@@ -663,11 +684,50 @@ class QubePipesApp:
         labels = []
         for i, conn in enumerate(sorted_conns):
             self.draw_connection_line(conn, i, len(sorted_conns), labels)
-        for lx, ly, text, color, tag in labels:
+
+        # Task 4: collision detection — track placed label bboxes to avoid overlap.
+        placed_bboxes = []  # list of (x1, y1, x2, y2) for each placed label+bg
+
+        def _bboxes_overlap(b1, b2, margin=4):
+            """Check if two bounding boxes overlap (with a small margin)."""
+            return not (b1[2] + margin < b2[0] or b2[2] + margin < b1[0]
+                        or b1[3] + margin < b2[1] or b2[3] + margin < b1[1])
+
+        # Sort labels by y-position so topmost labels claim their preferred spot first.
+        for lx, ly, text, color, tag in sorted(labels, key=lambda l: l[1]):
             cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
             lx, ly = max(10, min(cw - 10, lx)), max(10, min(ch - 10, ly))
-            text_id = self.canvas.create_text(lx, ly, text=text, font=FONT_BOLD,
-                fill=color, tags=("vm_element", "connection_label", tag))
+
+            # Measure text size to predict bbox before drawing.
+            text_id_tmp = self.canvas.create_text(lx, ly, text=text,
+                font=FONT_BOLD, fill=color, tags=("vm_element", "connection_label", tag))
+            tmp_bbox = self.canvas.bbox(text_id_tmp)
+            if not tmp_bbox:
+                continue
+            tw = tmp_bbox[2] - tmp_bbox[0]
+            th = tmp_bbox[3] - tmp_bbox[1]
+            self.canvas.delete(text_id_tmp)
+
+            # Try to find a non-overlapping y-shift.
+            # Strategy: try original position first, then expand outward
+            # (above and below simultaneously) until a free slot is found.
+            shift = 0
+            for attempt in range(25):
+                test_y = ly + shift
+                test_bbox = (lx - tw // 2, test_y - th // 2,
+                             lx + tw // 2, test_y + th // 2)
+                if not any(_bboxes_overlap(test_bbox, pb) for pb in placed_bboxes):
+                    break
+                # Expand outward: alternate above and below with increasing distance.
+                step = (attempt // 2 + 1) * 8
+                shift = -step if attempt % 2 == 0 else step
+            else:
+                shift = 0  # give up after max iterations
+
+            final_ly = ly + shift
+            text_id = self.canvas.create_text(lx, final_ly, text=text,
+                font=FONT_BOLD, fill=color,
+                tags=("vm_element", "connection_label", tag))
             bbox = self.canvas.bbox(text_id)
             if bbox:
                 bg_rect = self.canvas.create_rectangle(
@@ -675,6 +735,8 @@ class QubePipesApp:
                     fill=THEME["bg"], outline=color, width=1,
                     tags=("vm_element", "connection_label", tag))
                 self.canvas.tag_lower(bg_rect, text_id)
+                placed_bboxes.append((bbox[0] - 2, bbox[1] - 2, bbox[2] + 2, bbox[3] + 2))
+
         self.canvas.tag_raise("connection_label")
         if self.canvas.find_withtag("connection"):
             for vm in self.vms.values():

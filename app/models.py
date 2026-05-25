@@ -21,6 +21,15 @@ class VM:
     def update_ports(self, ports):
         self.ports = ports
 
+    @property
+    def error_ports(self):
+        """Ports that had connections but are no longer listening."""
+        return getattr(self, '_error_ports', set())
+
+    @error_ports.setter
+    def error_ports(self, value):
+        self._error_ports = value
+
 
 class Connection:
     """Represents an active TCP pipe between two VMs."""
