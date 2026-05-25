@@ -37,16 +37,16 @@ THEME = {
 # Layout geometry — single source of truth for all canvas math.  Every
 # hardcoded coordinate in ui.py must derive from these values.
 LAYOUT = {
-    "vm_half_w":       55,       # half of VM box width  (full = 110)
-    "vm_half_h":       45,       # half of VM box height (full = 90)
-    "grid_origin_x":   140,      # x of first column centre
+    "vm_half_w":       55,       # half of VM box width (full = 110)
+    "base_vm_h":       90,       # minimum full VM height; actual grows with ports
+    "grid_origin_x":   180,      # INCREASED from 140 to shift everything rightward gracefully
     "grid_origin_y":   80,       # y of first row centre
     "col_spacing":     280,      # horizontal distance between column centres
-    "row_spacing":     160,      # vertical distance between row centres
     "v_chan_offset":   95,       # x-offset from column centre → vertical routing channel
     "min_canvas_width": 1200,    # fallback width when winfo_width is unreliable
     "resize_threshold": 20,      # px delta that triggers a full re-render
 }
+MIN_ROW_GAP = 80                 # min gap between rows
 
 FONT_MAIN = ("Helvetica", 10)
 FONT_BOLD = ("Helvetica", 10, "bold")

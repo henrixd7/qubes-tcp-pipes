@@ -16,7 +16,7 @@ try:
     # Package mode: explicit imports from sibling modules
     from app.utils import (
         THEME, FONT_MAIN, FONT_BOLD, FONT_LARGE, FONT_SMALL,
-        LAYOUT, CACHE_REFRESH_INTERVAL, get_port_color,
+        LAYOUT, MIN_ROW_GAP, CACHE_REFRESH_INTERVAL, get_port_color,
     )
     from app.models import VM
     from app.cache import save_port_cache, load_port_cache
@@ -25,8 +25,20 @@ try:
         cleanup_policy_file, get_running_vms, get_listening_ports,
         is_connection_alive,
     )
+    from app.routing import build_grid, route_connection, Route
 except ImportError:
-    pass  # concatenated mode: all symbols already in global scope
+    # Concatenated mode: routing symbols should be in global scope.
+    # If not, something went wrong with the build order.
+    if 'build_grid' not in globals():
+        raise RuntimeError(
+            "Routing module not available. Make sure app/routing.py is "
+            "loaded before app/ui.py (check build.sh order)."
+        )
+
+# ── Channel-grid routing (imported from app.routing) ─────────────────────
+# RoutingGrid, VChannel, HChannel, Route, build_grid(), route_connection()
+# are all defined in app/routing.py to keep the UI module focused.
+# ── End channel-grid model ───────────────────────────────────────────────
 
 
 class QubePipesApp:
@@ -237,17 +249,86 @@ class QubePipesApp:
         if width < 10:
             width = LAYOUT["min_canvas_width"]
         cols = max(1, width // LAYOUT["col_spacing"])
+
+        # --- Phase 1: compute per-VM heights from port counts ---
+        for vm in self.vms.values():
+            vm.half_h = self._vm_height(vm.ports) // 2
+
+        # --- Phase 2: determine row boundaries and cumulative y positions ---
+        n_vms = len(self.vms)
+        max_row_idx = (n_vms - 1) // cols if n_vms else 0
+        row_max_heights = {}   # tallest VM in each row
+        row_max_top = {}       # highest top edge (= shortest VM's top) — for safe-zone routing
+        for i, vm in enumerate(self.vms.values()):
+            row = i // cols
+            h = vm.half_h * 2
+            row_max_heights[row] = max(row_max_heights.get(row, 0), h)
+
+        row_y_positions = {}
+        y = LAYOUT["grid_origin_y"]
+        for r in range(max_row_idx + 1):
+            row_y_positions[r] = y
+            h = row_max_heights.get(r, LAYOUT["base_vm_h"])
+            y += h + MIN_ROW_GAP
+
+        # Compute row_max_top with actual y positions now known.
+        for i, vm in enumerate(self.vms.values()):
+            row = i // cols
+            top_edge = vm.y - vm.half_h
+            row_max_top[row] = max(row_max_top.get(row, float('-inf')), top_edge)
+
+        # Store row boundary info for routing (used by channel grid)
+        self._row_starts = dict(row_y_positions)
+        self._row_max_heights = dict(row_max_heights)
+        self._row_max_tops = dict(row_max_top)
+
+        # Build the channel-grid model from layout data.
+        self._build_routing_grid()
+
+        # --- Phase 3: position VMs and draw them ---
         for i, (name, vm) in enumerate(self.vms.items()):
             row, col = divmod(i, cols)
             vm.x = LAYOUT["grid_origin_x"] + col * LAYOUT["col_spacing"]
-            vm.y = LAYOUT["grid_origin_y"] + row * LAYOUT["row_spacing"]
+            vm.y = row_y_positions[row]
             self.draw_vm_box(vm)
             if vm.ports:
                 self.update_vm_ports_ui(name, vm.ports, redraw_lines=False)
         self.redraw_connections()
 
+    # ── Channel-grid routing ────────────────────────────────────────────
+
+    def _build_routing_grid(self):
+        """Build the channel grid from current VM layout data."""
+        n_vms = len(self.vms)
+        cols = max(1, self.canvas.winfo_width() // LAYOUT["col_spacing"])
+        canvas_h = self.canvas.winfo_height()
+        self._routing_grid = build_grid(
+            n_vms, cols,
+            self._row_starts, self._row_max_heights,
+            self.canvas.winfo_width(), canvas_h,
+            LAYOUT,
+        )
+
+    def _route_connection(self, conn):
+        """Compute a route through the channel grid for one connection."""
+        grid = getattr(self, '_routing_grid', None)
+        if not grid:
+            return None
+
+        client_vm = self.vms.get(conn.client_name)
+        server_vm = self.vms.get(conn.server_name)
+        if not client_vm or not server_vm:
+            return None
+
+        return route_connection(
+            grid, client_vm, server_vm,
+            conn.local_port, conn.remote_port,
+            self._port_side, self._vm_column, self._row_for_y,
+        )
+
     def draw_vm_box(self, vm):
-        px, py = LAYOUT["vm_half_w"], LAYOUT["vm_half_h"]
+        px = LAYOUT["vm_half_w"]
+        py = getattr(vm, 'half_h', None) or (LAYOUT["base_vm_h"] // 2)
         vm.shadow_id = self.canvas.create_rectangle(
             vm.x - px + 2, vm.y - py + 2, vm.x + px + 2, vm.y + py + 2,
             fill=THEME["shadow"], outline="", tags=("vm_element", "vm_box", vm.name))
@@ -255,7 +336,8 @@ class QubePipesApp:
             vm.x - px, vm.y - py, vm.x + px, vm.y + py,
             fill=THEME["vm_bg"], outline=THEME["vm_border"], width=2,
             tags=("vm_element", "vm_box", vm.name))
-        cx, cy = vm.x, vm.y - 30
+        cx = vm.x
+        cy = vm.y - py + 15   # 15 px from top edge instead of hardcoded offset
         c_tag = ("vm_element", "vm_box", vm.name)
         vm.icon_ids = [
             self.canvas.create_rectangle(cx - 8, cy - 6, cx + 8, cy + 6, outline=THEME["text_muted"], tags=c_tag),
@@ -286,40 +368,137 @@ class QubePipesApp:
             vm = self.vms[name]
             sorted_ports = sorted(ports, key=lambda p: int(p) if p.isdigit() else p)
             vm.update_ports(sorted_ports)
+            # Recalculate VM height based on new port count.
+            old_half_h = getattr(vm, 'half_h', None)
+            vm.half_h = self._vm_height(vm.ports) // 2
+            half_h_changed = old_half_h is not None and old_half_h != vm.half_h
+
+            # If VM grew/shrank, rebuild routing grid with updated heights.
+            if half_h_changed:
+                cols = max(1, self.canvas.winfo_width() // LAYOUT["col_spacing"])
+                n_vms = len(self.vms)
+                # Recompute row_max_heights from current VM heights.
+                new_max_h = {}
+                for v in self.vms.values():
+                    r = (v.y - LAYOUT["grid_origin_y"]) // (LAYOUT["base_vm_h"] + MIN_ROW_GAP) if hasattr(self, '_row_starts') else 0
+                    h = v.half_h * 2
+                    new_max_h[r] = max(new_max_h.get(r, 0), h)
+                self._row_max_heights = new_max_h
+                canvas_h = self.canvas.winfo_height()
+                self._routing_grid = build_grid(
+                    n_vms, cols,
+                    getattr(self, '_row_starts', {0: LAYOUT["grid_origin_y"]}),
+                    self._row_max_heights,
+                    self.canvas.winfo_width(), canvas_h,
+                    LAYOUT,
+                )
         for pid in vm.port_ids.values():
             self.canvas.delete(pid)
         vm.port_ids.clear()
         self.canvas.delete(f"vm_port_{name}")
-        px, py_val = LAYOUT["vm_half_w"], LAYOUT["vm_half_h"]
-        x2 = vm.x + px
+        px = LAYOUT["vm_half_w"]
+        py_val = getattr(vm, 'half_h', None) or (LAYOUT["base_vm_h"] // 2)
         y1, y2 = vm.y - py_val, vm.y + py_val
+        max_per_side = self._max_ports_per_side(vm)
+        n_right = min(len(sorted_ports), max_per_side)
+        n_left = len(sorted_ports) - max_per_side
         for i, port in enumerate(sorted_ports):
-            py_pos = y1 + (i + 1) * (y2 - y1) / (len(sorted_ports) + 1)
+            if i < max_per_side:
+                # Right side
+                x2 = vm.x + px
+                py_pos = y1 + (i + 1) * (y2 - y1) / (n_right + 1)
+                text_x = x2 + 24
+            else:
+                # Left side
+                local_idx = i - max_per_side
+                x2 = vm.x - px
+                py_pos = y1 + (local_idx + 1) * (y2 - y1) / (n_left + 1)
+                text_x = x2 - 24
             port_tag = f"vm_port_{name}"
             port_id = self.canvas.create_oval(
                 x2 - 6, py_pos - 6, x2 + 6, py_pos + 6,
                 fill=THEME["port_fill"], outline=THEME["port_border"], width=1,
                 tags=("vm_element", "port", port_tag))
-            self.canvas.create_text(x2 + 24, py_pos, text=port, font=FONT_MAIN,
-                fill=THEME["text_main"], tags=("vm_element", "port_text", port_tag))
+            self.canvas.create_text(text_x, py_pos, text=port, font=FONT_MAIN,
+                fill=THEME["text_main"], anchor=tk.E if i >= max_per_side else tk.W,
+                tags=("vm_element", "port_text", port_tag))
             vm.port_ids[port] = port_id
         if redraw_lines:
             self.redraw_connections()
 
+    # ── Port-side helpers ───────────────────────────────────────────────
+
+    def _vm_height(self, ports):
+        """Compute the required full height for a VM given its port list.
+
+        per_side = ceil(n / 2), then H = max(base_vm_h, (per_side + 1) * 14).
+        Each additional pair of ports adds exactly 14 px."""
+        n = len(ports) if ports else 0
+        per_side = math.ceil(n / 2) if n > 0 else 0
+        return max(LAYOUT["base_vm_h"], (per_side + 1) * 14) if per_side > 0 else LAYOUT["base_vm_h"]
+
+    def _max_ports_per_side(self, vm):
+        """Calculate how many ports can fit on one edge without circles overlapping.
+
+        Spacing between port centres = H / (N + 1).  We need at least
+        MIN_PORT_SPACING px so that the 12 px-diameter circles don't overlap.
+        Returns max N such that H / (N + 1) >= MIN_PORT_SPACING, clamped to >= 1."""
+        height = 2 * vm.half_h if hasattr(vm, 'half_h') and vm.half_h else LAYOUT["base_vm_h"]
+        min_spacing = 14  # px between centres; circles are 12 px diameter
+        return max(1, int(height / min_spacing) - 1)
+
+    def _port_side(self, vm, port):
+        """Return 'right' or 'left' depending on which edge a port lives on."""
+        all_ports = sorted(vm.ports, key=lambda p: int(p) if p.isdigit() else p)
+        try:
+            idx = all_ports.index(str(port))
+        except ValueError:
+            return "right"
+        return "left" if idx >= self._max_ports_per_side(vm) else "right"
+
+    def _vm_column(self, vm):
+        """Return the grid column index of a VM."""
+        return int((vm.x - LAYOUT["grid_origin_x"]) // LAYOUT["col_spacing"])
+
+    def _row_for_y(self, y):
+        """Return the row index that contains the given y-coordinate.
+
+        Scans stored row boundaries in reverse order (bottom → top).
+        """
+        if not hasattr(self, '_row_starts') or not self._row_starts:
+            return 0
+        for r in sorted(self._row_starts.keys(), reverse=True):
+            if y >= self._row_starts[r]:
+                return r
+        return 0
+
     def get_port_coords(self, vm, port):
-        """Pure mathematical alignment calculation. Prevents Tkinter race-condition jitter."""
-        px, py = LAYOUT["vm_half_w"], LAYOUT["vm_half_h"]
-        x2 = vm.x + px
+        """Pure mathematical alignment calculation. Prevents Tkinter race-condition jitter.
+
+        Returns (x, y) where x is on the right or left edge depending on which
+        side the port lives on."""
+        px = LAYOUT["vm_half_w"]
+        py = getattr(vm, 'half_h', None) or (LAYOUT["base_vm_h"] // 2)
         y1, y2 = vm.y - py, vm.y + py
         all_ports = sorted(vm.ports, key=lambda p: int(p) if p.isdigit() else p)
         if not all_ports:
-            return x2, (y1 + y2) / 2
+            return vm.x + px, (y1 + y2) / 2
         try:
             idx = all_ports.index(str(port))
         except ValueError:
             idx = 0
-        py_pos = y1 + (idx + 1) * (y2 - y1) / (len(all_ports) + 1)
-        return x2, py_pos
+        max_per_side = self._max_ports_per_side(vm)
+        if idx < max_per_side:
+            # Right side — spacing among right-side ports only
+            n_right = min(len(all_ports), max_per_side)
+            py_pos = y1 + (idx + 1) * (y2 - y1) / (n_right + 1)
+            return vm.x + px, py_pos
+        else:
+            # Left side — spacing among left-side ports only
+            n_left = len(all_ports) - max_per_side
+            local_idx = idx - max_per_side
+            py_pos = y1 + (local_idx + 1) * (y2 - y1) / (n_left + 1)
+            return vm.x - px, py_pos
 
     def on_click(self, event):
         for vm in self.vms.values():
@@ -370,35 +549,6 @@ class QubePipesApp:
             f"Sever connection from {target_conn.client_name} to {target_conn.server_name}:{target_conn.remote_port}?"):
             self.delete_connection(target_conn)
 
-    def _compute_route(self, src_x, src_y, dst_x, dst_y, idx, total):
-        """Orthogonal channel routing strictly avoiding VM boxes and nesting parallel lanes."""
-        lane_spacing = 10
-        offset = (idx - (total - 1) / 2.0) * lane_spacing
-        col_src = int((src_x - LAYOUT["grid_origin_x"]) // LAYOUT["col_spacing"])
-        col_dst = int((dst_x - LAYOUT["grid_origin_x"]) // LAYOUT["col_spacing"])
-        row_src = int((src_y - LAYOUT["grid_origin_y"] + LAYOUT["vm_half_h"]) // LAYOUT["row_spacing"])
-        row_dst = int((dst_y - LAYOUT["grid_origin_y"] + LAYOUT["vm_half_h"]) // LAYOUT["row_spacing"])
-        path = [(src_x, src_y)]
-        v_chan_src = (LAYOUT["grid_origin_x"] + col_src * LAYOUT["col_spacing"]) + LAYOUT["v_chan_offset"] + offset
-        v_chan_dst = (LAYOUT["grid_origin_x"] + col_dst * LAYOUT["col_spacing"]) + LAYOUT["v_chan_offset"] + offset
-        max_row = max(row_src, row_dst)
-        if col_src == col_dst:
-            if row_src == row_dst:
-                path.extend([(v_chan_src, src_y), (v_chan_src, dst_y), (dst_x, dst_y)])
-            else:
-                path.extend([(v_chan_src, src_y), (v_chan_src, dst_y), (dst_x, dst_y)])
-            return path, v_chan_src + 6, (src_y + dst_y) / 2
-        if row_src == row_dst:
-            h_chan = LAYOUT["row_spacing"] * (row_src + 1) + offset
-        else:
-            h_chan = LAYOUT["row_spacing"] * max_row + offset
-        path.extend([
-            (v_chan_src, src_y), (v_chan_src, h_chan),
-            (v_chan_dst, h_chan), (v_chan_dst, dst_y), (dst_x, dst_y)])
-        label_x = (v_chan_src + v_chan_dst) / 2
-        label_y = h_chan - 12
-        return path, label_x, label_y
-
     def _smooth_path(self, path, radius=15):
         """Mathematically generates a smooth, curved path to avoid Tkinter's finicky spline rendering."""
         if len(path) < 3:
@@ -434,9 +584,52 @@ class QubePipesApp:
         else:
             src_x, src_y = client_vm.x, client_vm.y
         dst_x, dst_y = self.get_port_coords(server_vm, str(conn.remote_port))
+
+        # Route through the channel grid.
+        route = getattr(conn, '_route', None)
+        if not route:
+            return  # no valid route — skip this connection
+
+        grid = self._routing_grid
+        v_src_ch = grid.v_channels.get(route.v_src_idx)
+        v_dst_ch = grid.v_channels.get(route.v_dst_idx)
+        if not v_src_ch or not v_dst_ch:
+            return
+
+        # Lane registration happens automatically in lane_x/lane_y.
+        vc_x_src = v_src_ch.lane_x(conn)
+        vc_x_dst = v_dst_ch.lane_x(conn)
+
         conn_tag = f"conn_{id(conn)}"
         line_color = get_port_color(conn.remote_port)
-        path, label_x, label_y = self._compute_route(src_x, src_y, dst_x, dst_y, idx, total)
+
+        if route.h_chan_idx is None:
+            # Same V-channel — vertical routing only.
+            path = [(src_x, src_y), (vc_x_src, src_y),
+                    (vc_x_src, dst_y), (dst_x, dst_y)]
+            label_x = vc_x_src + 6
+            label_y = (src_y + dst_y) / 2
+        else:
+            # Cross-column routing through an H-channel.
+            h_ch = grid.h_channels.get(route.h_chan_idx)
+            if not h_ch:
+                # No H-channel available — compute a fallback horizontal position
+                # below both VMs (below the tallest one in their row).
+                starts = getattr(self, '_row_starts', {})
+                max_h = getattr(self, '_row_max_heights', {})
+                same_row = self._row_for_y(client_vm.y)
+                h_y = (starts.get(same_row, 0) + max_h.get(same_row, LAYOUT["base_vm_h"])
+                       + MIN_ROW_GAP // 2)
+            else:
+                h_y = h_ch.lane_y(conn)
+
+            path = [(src_x, src_y),
+                    (vc_x_src, src_y), (vc_x_src, h_y),
+                    (vc_x_dst, h_y), (vc_x_dst, dst_y),
+                    (dst_x, dst_y)]
+            label_x = (vc_x_src + vc_x_dst) / 2
+            label_y = h_y - 12
+
         smoothed_path = self._smooth_path(path, radius=8)
         flat_coords = [c for pt in smoothed_path for c in pt]
         conn.line_id = self.canvas.create_line(
@@ -451,9 +644,23 @@ class QubePipesApp:
     def redraw_connections(self):
         self.canvas.delete("connection")
         self.canvas.delete("connection_label")
-        labels = []
+
+        # Clear channel occupancy from previous render.
+        grid = getattr(self, '_routing_grid', None)
+        if grid:
+            for ch in list(grid.v_channels.values()) + list(grid.h_channels.values()):
+                ch.lanes.clear()
+
         sorted_conns = sorted(self.connections, key=lambda c: (
             c.server_name, c.remote_port, c.client_name, c.local_port))
+
+        # Phase 1: route all connections through the grid.
+        for conn in sorted_conns:
+            route = self._route_connection(conn)
+            conn._route = route
+
+        # Phase 2: draw all connections.
+        labels = []
         for i, conn in enumerate(sorted_conns):
             self.draw_connection_line(conn, i, len(sorted_conns), labels)
         for lx, ly, text, color, tag in labels:
