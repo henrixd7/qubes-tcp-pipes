@@ -20,6 +20,12 @@ except ImportError:
 
 def get_running_vms():
     """Return names of running, non-system VMs."""
+    vms = try_get_running_vms()
+    return vms if vms is not None else []
+
+
+def try_get_running_vms():
+    """Return running VM names, or None if Qubes state could not be read."""
     try:
         qapp = qubesadmin.Qubes()
         return [
@@ -32,7 +38,7 @@ def get_running_vms():
         ]
     except Exception as e:
         print(f"Error accessing qubesadmin: {e}")
-        return []
+        return None
 
 
 def get_listening_ports(vm_name):

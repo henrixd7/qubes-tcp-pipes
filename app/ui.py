@@ -5,12 +5,16 @@
 # When concatenated into a single-file build this module is loaded fifth.
 
 import math
+import asyncio
 import signal
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
+
+import qubesadmin
+import qubesadmin.events
 
 try:
     # Package mode: explicit imports from sibling modules
@@ -22,8 +26,8 @@ try:
     from app.cache import save_port_cache, load_port_cache
     from app.qubes import (
         create_connection, kill_connection_process, remove_policy_rule,
-        cleanup_policy_file, get_running_vms, get_listening_ports,
-        is_connection_alive,
+        cleanup_policy_file, get_listening_ports, is_connection_alive,
+        try_get_running_vms,
     )
     from app.routing import build_grid, route_connection, Route
 except ImportError:
@@ -65,6 +69,7 @@ class QubePipesApp:
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Configure>", self.on_resize)
         self.start_background_refresh()
+        self.start_vm_event_watcher()
         self._update_status_timer()
 
     def _setup_ui(self):
@@ -129,12 +134,28 @@ class QubePipesApp:
 
     def refresh_vms(self):
         self.selected_source_vm = None
-        current_vms = get_running_vms()
+        current_vms = try_get_running_vms()
+        if current_vms is None:
+            self._last_refresh_time = time.time()
+            self.update_status_bar()
+            return
+        current_vm_names = set(current_vms)
         cache = load_port_cache()
+
+        with self._state_lock:
+            missing_endpoint_names = {
+                name
+                for conn in self.connections
+                for name in (conn.client_name, conn.server_name)
+                if name not in current_vm_names
+            }
+        for name in missing_endpoint_names:
+            self._cleanup_connections_for_vm(
+                name, "VM no longer running", update_ui=False,
+            )
+
         with self._state_lock:
             self.vms = {name: self.vms.get(name, VM(name, 0, 0)) for name in current_vms}
-            self.connections = [conn for conn in self.connections
-                if conn.client_name in self.vms and conn.server_name in self.vms]
             for name, vm in self.vms.items():
                 if name in cache:
                     vm.update_ports(cache[name])
@@ -142,6 +163,59 @@ class QubePipesApp:
         self._last_refresh_time = time.time()
         self.update_status_bar()
         threading.Thread(target=self.discover_ports_worker, daemon=True).start()
+
+    def start_vm_event_watcher(self):
+        """Start a best-effort Qubes event watcher for VM shutdown cleanup."""
+        thread = threading.Thread(target=self._run_vm_event_watcher, daemon=True)
+        thread.start()
+
+    def _run_vm_event_watcher(self):
+        try:
+            dispatcher = qubesadmin.events.EventsDispatcher(qubesadmin.Qubes())
+            dispatcher.add_handler("domain-shutdown", self._on_domain_shutdown)
+            asyncio.run(dispatcher.listen_for_events())
+        except Exception as e:
+            print(f"Warning: Qubes event watcher unavailable: {e}")
+
+    def _on_domain_shutdown(self, subject, event, **_kwargs):
+        vm_name = getattr(subject, "name", str(subject))
+        self._cleanup_connections_for_vm(vm_name, event)
+
+    def _cleanup_connections_for_vm(self, vm_name, reason, update_ui=True):
+        """Clean up every connection involving *vm_name*."""
+        return self._cleanup_connections_matching(
+            lambda conn: conn.client_name == vm_name or conn.server_name == vm_name,
+            reason,
+            update_ui=update_ui,
+        )
+
+    def _cleanup_connections_matching(self, predicate, reason, update_ui=True):
+        with self._state_lock:
+            removed = [conn for conn in self.connections if predicate(conn)]
+            if not removed:
+                return []
+            self.connections = [
+                conn for conn in self.connections if conn not in removed
+            ]
+
+        print(f"Cleaning up {len(removed)} connection(s): {reason}")
+        for conn in removed:
+            try:
+                kill_connection_process(conn)
+            except Exception as e:
+                print(f"Warning: failed to kill connection process: {e}")
+            try:
+                remove_policy_rule(conn)
+            except Exception as e:
+                print(f"Warning: failed to remove policy rule: {e}")
+
+        if update_ui:
+            try:
+                self.root.after(0, self.redraw_connections)
+                self.root.after(0, self.update_status_bar)
+            except Exception as e:
+                print(f"Warning: failed to schedule cleanup UI update: {e}")
+        return removed
 
     def discover_ports_worker(self):
         with self._state_lock:
@@ -194,19 +268,12 @@ class QubePipesApp:
 
     def _prune_dead_connections(self):
         """Remove connections whose qvm-run process has exited."""
-        pruned = False
-        with self._state_lock:
-            still_alive = []
-            for conn in self.connections:
-                if is_connection_alive(conn):
-                    still_alive.append(conn)
-                else:
-                    remove_policy_rule(conn)
-                    pruned = True
-
-            if pruned:
-                self.connections = still_alive
-        if pruned:
+        removed = self._cleanup_connections_matching(
+            lambda conn: not is_connection_alive(conn),
+            "qvm-run process exited",
+            update_ui=False,
+        )
+        if removed:
             self.redraw_connections()
 
     def _update_status_timer(self):
