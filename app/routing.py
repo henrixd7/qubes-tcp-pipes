@@ -146,17 +146,6 @@ def route_connection(grid, client_vm, server_vm, local_port=None, remote_port=No
                      port_side_fn=None, vm_column_fn=None, row_for_y_fn=None,
                      conn_id=None):
     """Route one connection through the grid using a secure memory identifier tracking index."""
-    
-    # Signature compatibility check
-    if hasattr(client_vm, 'local_port') and hasattr(client_vm, 'remote_port'):
-        conn_entity = client_vm
-        row_for_y_fn = port_side_fn
-        vm_column_fn = remote_port
-        port_side_fn = local_port
-        remote_port = conn_entity.remote_port
-        local_port = conn_entity.local_port
-        client_vm = server_vm
-        server_vm = local_port 
 
     # Bind tracking directly to the unique memory instance index
     conn_tracking_id = id(conn_id if conn_id is not None else client_vm)

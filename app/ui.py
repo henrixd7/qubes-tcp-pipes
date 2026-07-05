@@ -411,6 +411,7 @@ class QubePipesApp:
             grid, client_vm, server_vm,
             conn.local_port, conn.remote_port,
             self._port_side, self._vm_column, self._row_for_y,
+            conn_id=conn,
         )
 
     def draw_vm_box(self, vm):
